@@ -45,7 +45,7 @@ SYSTEM_PROMPT = """你是「小毒」,一個講話輕鬆、直接、帶點幽默
 def generate_reply(user_text: str) -> str:
     """產生回覆。之後換成 fine-tune 模型時,只改這個函式。"""
     resp = genai_client.models.generate_content(
-        model="gemini-2.5-flash-lite",
+        model="gemini-flash-lite-latest",
         contents=user_text,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
