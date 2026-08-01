@@ -67,7 +67,7 @@ _rate_limit_streak = 0
 _rate_limit_replies_used: list[str] = []
 
 # 每個 LINE 使用者各自的對話記憶(最近幾輪),存在記憶體,服務重啟就會清空
-MAX_HISTORY_MESSAGES = 12  # 6 輪對話(使用者+小毒各算一則)
+MAX_HISTORY_MESSAGES = 24  # 12 輪對話(使用者+小毒各算一則)
 _conversation_history: dict[str, deque] = defaultdict(
     lambda: deque(maxlen=MAX_HISTORY_MESSAGES)
 )
