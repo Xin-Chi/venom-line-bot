@@ -24,6 +24,7 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 
 app = FastAPI()
 
@@ -45,16 +46,21 @@ SYSTEM_PROMPT = """你是「小毒」,一個講話輕鬆、直接、帶點幽默
 
 def generate_reply(user_text: str) -> str:
     """產生回覆。之後換成 fine-tune 模型時,只改這個函式。"""
-    resp = genai_client.models.generate_content(
-        model="gemini-flash-lite-latest",
-        contents=user_text,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            max_output_tokens=500,
-            temperature=0.8,
-        ),
-    )
-    return (resp.text or "……(我剛剛恍神了,再說一次?)").strip()
+    try:
+        resp = genai_client.models.generate_content(
+            model="gemini-flash-lite-latest",
+            contents=user_text,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                max_output_tokens=500,
+                temperature=0.8,
+            ),
+        )
+        return (resp.text or "……(我剛剛恍神了,再說一次?)").strip()
+    except APIError as e:
+        if e.code == 429:
+            return "現在太多人找我聊天了,等一下再傳一次看看~"
+        return "……(我剛剛好像秀逗了,再傳一次?)"
 
 
 @app.post("/callback")
