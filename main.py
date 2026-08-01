@@ -11,6 +11,7 @@ Venom-Bot LINE integration — Stage 1 (Gemini backend)
 
 import os
 import random
+from collections import defaultdict, deque
 
 from fastapi import FastAPI, Request, HTTPException
 from linebot.v3 import WebhookParser
@@ -53,19 +54,46 @@ RATE_LIMIT_REPLIES = (
 )
 RATE_LIMIT_REPLY_LIMIT = 2  # 連續遇到 429 最多回這麼多次,之後閉嘴到額度重置為止
 
+MAX_INPUT_LENGTH = 500  # 超過這個字數不丟給 Gemini,直接吐槽
+TOO_LONG_REPLIES = (
+    "有沒有懶人包",
+    "我還好 字有點多",
+    "來個懶包 我看不完",
+    "字太多 我好懶",
+)
+
 # 連續 429 的次數與已經用過的回覆,額度視窗重置(下次呼叫成功)時歸零
 _rate_limit_streak = 0
 _rate_limit_replies_used: list[str] = []
 
+# 每個 LINE 使用者各自的對話記憶(最近幾輪),存在記憶體,服務重啟就會清空
+MAX_HISTORY_MESSAGES = 12  # 6 輪對話(使用者+小毒各算一則)
+_conversation_history: dict[str, deque] = defaultdict(
+    lambda: deque(maxlen=MAX_HISTORY_MESSAGES)
+)
 
-def generate_reply(user_text: str) -> str | None:
+
+def generate_reply(user_id: str, user_text: str) -> str | None:
     """產生回覆。之後換成 fine-tune 模型時,只改這個函式。
     回傳 None 代表這則訊息選擇不回覆(已讀不回)。"""
     global _rate_limit_streak, _rate_limit_replies_used
+    history = _conversation_history[user_id]
+
+    if len(user_text) > MAX_INPUT_LENGTH:
+        reply_text = random.choice(TOO_LONG_REPLIES)
+        history.append(
+            types.Content(role="user", parts=[types.Part(text="(對方傳了一大串文字,沒細看)")])
+        )
+        history.append(types.Content(role="model", parts=[types.Part(text=reply_text)]))
+        return reply_text
+
+    contents = list(history) + [
+        types.Content(role="user", parts=[types.Part(text=user_text)])
+    ]
     try:
         resp = genai_client.models.generate_content(
             model="gemini-flash-lite-latest",
-            contents=user_text,
+            contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 max_output_tokens=500,
@@ -74,7 +102,10 @@ def generate_reply(user_text: str) -> str | None:
         )
         _rate_limit_streak = 0
         _rate_limit_replies_used = []
-        return (resp.text or "……(我剛剛恍神了,再說一次?)").strip()
+        reply_text = (resp.text or "……(我剛剛恍神了,再說一次?)").strip()
+        history.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
+        history.append(types.Content(role="model", parts=[types.Part(text=reply_text)]))
+        return reply_text
     except APIError as e:
         if e.code == 429:
             _rate_limit_streak += 1
@@ -102,7 +133,8 @@ async def callback(request: Request):
         if isinstance(event, MessageEvent) and isinstance(
             event.message, TextMessageContent
         ):
-            reply_text = generate_reply(event.message.text)
+            user_id = getattr(event.source, "user_id", None) or "unknown"
+            reply_text = generate_reply(user_id, event.message.text)
             if reply_text is None:
                 continue
             with ApiClient(line_config) as api_client:
