@@ -51,10 +51,17 @@ RATE_LIMIT_REPLIES = (
     "我去吃飯了掰掰",
     "我要已讀你了",
 )
+RATE_LIMIT_REPLY_LIMIT = 2  # 連續遇到 429 最多回這麼多次,之後閉嘴到額度重置為止
+
+# 連續 429 的次數與已經用過的回覆,額度視窗重置(下次呼叫成功)時歸零
+_rate_limit_streak = 0
+_rate_limit_replies_used: list[str] = []
 
 
-def generate_reply(user_text: str) -> str:
-    """產生回覆。之後換成 fine-tune 模型時,只改這個函式。"""
+def generate_reply(user_text: str) -> str | None:
+    """產生回覆。之後換成 fine-tune 模型時,只改這個函式。
+    回傳 None 代表這則訊息選擇不回覆(已讀不回)。"""
+    global _rate_limit_streak, _rate_limit_replies_used
     try:
         resp = genai_client.models.generate_content(
             model="gemini-flash-lite-latest",
@@ -65,10 +72,18 @@ def generate_reply(user_text: str) -> str:
                 temperature=0.8,
             ),
         )
+        _rate_limit_streak = 0
+        _rate_limit_replies_used = []
         return (resp.text or "……(我剛剛恍神了,再說一次?)").strip()
     except APIError as e:
         if e.code == 429:
-            return random.choice(RATE_LIMIT_REPLIES)
+            _rate_limit_streak += 1
+            if _rate_limit_streak > RATE_LIMIT_REPLY_LIMIT:
+                return None
+            choices = [r for r in RATE_LIMIT_REPLIES if r not in _rate_limit_replies_used]
+            reply = random.choice(choices)
+            _rate_limit_replies_used.append(reply)
+            return reply
         return "……(我剛剛好像秀逗了,再傳一次?)"
 
 
@@ -88,6 +103,8 @@ async def callback(request: Request):
             event.message, TextMessageContent
         ):
             reply_text = generate_reply(event.message.text)
+            if reply_text is None:
+                continue
             with ApiClient(line_config) as api_client:
                 MessagingApi(api_client).reply_message(
                     ReplyMessageRequest(
