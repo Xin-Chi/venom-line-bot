@@ -20,10 +20,16 @@ from linebot.v3.messaging import (
     Configuration,
     ApiClient,
     MessagingApi,
+    MessagingApiBlob,
     ReplyMessageRequest,
     TextMessage,
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhooks import (
+    MessageEvent,
+    TextMessageContent,
+    StickerMessageContent,
+    ImageMessageContent,
+)
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
@@ -73,9 +79,16 @@ _conversation_history: dict[str, deque] = defaultdict(
 )
 
 
-def generate_reply(user_id: str, user_text: str) -> str | None:
+def generate_reply(
+    user_id: str,
+    user_text: str,
+    image_bytes: bytes | None = None,
+    image_mime: str = "image/jpeg",
+) -> str | None:
     """產生回覆。之後換成 fine-tune 模型時,只改這個函式。
-    回傳 None 代表這則訊息選擇不回覆(已讀不回)。"""
+    回傳 None 代表這則訊息選擇不回覆(已讀不回)。
+    image_bytes 有帶的話,連同 user_text 一起送給 Gemini 做圖片理解;
+    但圖片本身不存進歷史記憶(太占空間/token),只留 user_text 這句描述。"""
     global _rate_limit_streak, _rate_limit_replies_used
     history = _conversation_history[user_id]
 
@@ -87,9 +100,11 @@ def generate_reply(user_id: str, user_text: str) -> str | None:
         history.append(types.Content(role="model", parts=[types.Part(text=reply_text)]))
         return reply_text
 
-    contents = list(history) + [
-        types.Content(role="user", parts=[types.Part(text=user_text)])
-    ]
+    parts = [types.Part(text=user_text)]
+    if image_bytes:
+        parts.append(types.Part.from_bytes(data=image_bytes, mime_type=image_mime))
+
+    contents = list(history) + [types.Content(role="user", parts=parts)]
     try:
         resp = genai_client.models.generate_content(
             model="gemini-flash-lite-latest",
@@ -130,20 +145,42 @@ async def callback(request: Request):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     for event in events:
-        if isinstance(event, MessageEvent) and isinstance(
-            event.message, TextMessageContent
-        ):
-            user_id = getattr(event.source, "user_id", None) or "unknown"
-            reply_text = generate_reply(user_id, event.message.text)
-            if reply_text is None:
-                continue
+        if not isinstance(event, MessageEvent):
+            continue
+
+        user_id = getattr(event.source, "user_id", None) or "unknown"
+        message = event.message
+
+        if isinstance(message, TextMessageContent):
+            reply_text = generate_reply(user_id, message.text)
+        elif isinstance(message, StickerMessageContent):
+            if message.keywords:
+                desc = f"(對方傳了一個貼圖,關鍵字:{'、'.join(message.keywords[:5])})"
+            else:
+                desc = "(對方傳了一個貼圖)"
+            reply_text = generate_reply(user_id, desc)
+        elif isinstance(message, ImageMessageContent):
             with ApiClient(line_config) as api_client:
-                MessagingApi(api_client).reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=reply_text)],
-                    )
+                image_bytes = bytes(
+                    MessagingApiBlob(api_client).get_message_content(message.id)
                 )
+            reply_text = generate_reply(
+                user_id,
+                "(對方傳了一張圖片,用你的角色風格簡短回應圖片內容)",
+                image_bytes=image_bytes,
+            )
+        else:
+            continue
+
+        if reply_text is None:
+            continue
+        with ApiClient(line_config) as api_client:
+            MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)],
+                )
+            )
 
     return "OK"
 
