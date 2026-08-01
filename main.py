@@ -227,14 +227,16 @@ async def callback(request: Request):
         message = event.message
 
         if isinstance(message, TextMessageContent):
-            reply_text, meme_id = generate_reply(user_id, message.text)
+            input_desc = message.text
+            reply_text, meme_id = generate_reply(user_id, input_desc)
         elif isinstance(message, StickerMessageContent):
             if message.keywords:
-                desc = f"(對方傳了一個貼圖,關鍵字:{'、'.join(message.keywords[:5])})"
+                input_desc = f"(對方傳了一個貼圖,關鍵字:{'、'.join(message.keywords[:5])})"
             else:
-                desc = "(對方傳了一個貼圖)"
-            reply_text, meme_id = generate_reply(user_id, desc)
+                input_desc = "(對方傳了一個貼圖)"
+            reply_text, meme_id = generate_reply(user_id, input_desc)
         elif isinstance(message, ImageMessageContent):
+            input_desc = "(對方傳了一張圖片)"
             with ApiClient(line_config) as api_client:
                 image_bytes = bytes(
                     MessagingApiBlob(api_client).get_message_content(message.id)
@@ -246,6 +248,8 @@ async def callback(request: Request):
             )
         else:
             continue
+
+        print(f"[chat] user={user_id} in={input_desc!r} out={reply_text!r} meme={meme_id}")
 
         if reply_text is None:
             continue
