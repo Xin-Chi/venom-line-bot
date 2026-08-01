@@ -150,6 +150,7 @@ async def callback(request: Request):
             continue
 
         user_id = getattr(event.source, "user_id", None) or "unknown"
+        print(f"[user_id] {user_id}")
         message = event.message
 
         if isinstance(message, TextMessageContent):
