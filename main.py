@@ -16,6 +16,7 @@ from collections import defaultdict, deque
 from fastapi import FastAPI, Request, HTTPException
 from linebot.v3 import WebhookParser
 from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.messaging.exceptions import ApiException as LineApiException
 from linebot.v3.messaging import (
     Configuration,
     ApiClient,
@@ -174,13 +175,18 @@ async def callback(request: Request):
 
         if reply_text is None:
             continue
-        with ApiClient(line_config) as api_client:
-            MessagingApi(api_client).reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=reply_text)],
+        try:
+            with ApiClient(line_config) as api_client:
+                MessagingApi(api_client).reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text)],
+                    )
                 )
-            )
+        except LineApiException:
+            # reply_token 可能已過期(例如短時間內湧入大量訊息,排隊排太久)
+            # 這則就放棄,不要讓整個 webhook 請求 500 掛掉
+            continue
 
     return "OK"
 
