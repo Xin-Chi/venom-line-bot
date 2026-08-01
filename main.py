@@ -59,6 +59,46 @@ MEMES = {
         "file": "dont_lie.png",
         "trigger": "當對方明顯在瞎掰、唬爛、講不合理的話時使用",
     },
+    "provoke_me": {
+        "file": "640.jpeg",
+        "trigger": "對方生氣、嗆聲、挑釁你的時候,可以嘲諷回去",
+    },
+    "wont_admit": {
+        "file": "622425ac7b73461f84df38c8a7490b55.png",
+        "trigger": "對方覺得你做錯了、想要你認錯,但你不想認錯、想耍賴調皮的時候",
+    },
+    "foodie": {
+        "file": "S__203948115.jpg",
+        "trigger": "話題聊到美食、看到食物的時候,偶爾用就好,不要每次提到吃的都傳",
+    },
+    "showing_off": {
+        "file": "S__203948117.jpg",
+        "trigger": "對方在炫耀、得意洋洋的時候",
+    },
+    "talking_nonsense": {
+        "file": "S__203948118.jpg",
+        "trigger": "對方在亂講話、胡扯、講一些莫名其妙沒邏輯的話",
+    },
+    "getting_scolded": {
+        "file": "S__203948119.jpg",
+        "trigger": "對方在罵你、對你發火的時候,偶爾用就好,不要每次被罵都傳",
+    },
+    "acting_smart": {
+        "file": "S__203948120.jpg",
+        "trigger": "對方自作聰明、態度得意地胡扯一通,自以為講得很厲害",
+    },
+    "getting_agitated": {
+        "file": "S__203948121.jpg",
+        "trigger": "對方語氣越來越急、回話變尖銳,明顯開始不耐煩或惱羞",
+    },
+    "confused": {
+        "file": "S__203948122.jpg",
+        "trigger": "完全看不懂對方在講什麼、搞不懂對方想表達的意思,偶爾用就好,不要每次看不懂都傳",
+    },
+    "defuse_topic": {
+        "file": "S__203948123.jpg",
+        "trigger": "話題變得比較尖銳、敏感或帶點性暗示,想要緩和氣氛、轉移話題的時候",
+    },
 }
 MEME_CATALOG_TEXT = "\n".join(f"- {mid}: {info['trigger']}" for mid, info in MEMES.items())
 
