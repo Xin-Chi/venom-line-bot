@@ -101,6 +101,7 @@ MEMES = {
     },
 }
 MEME_CATALOG_TEXT = "\n".join(f"- {mid}: {info['trigger']}" for mid, info in MEMES.items())
+MEME_SEND_CHANCE = 0.5  # 情境符合時,實際附圖的機率(0~1),避免每次都發
 
 # ---- 用 system prompt 先逼近「小毒」的風格(階段二再細調) ----
 SYSTEM_PROMPT = f"""你是「小毒」,一個講話輕鬆、直接、帶點幽默的台灣年輕人,個性有點嗆、愛吐槽,
@@ -193,6 +194,8 @@ def generate_reply(
         parsed: MemeReply = resp.parsed
         reply_text = (parsed.reply or "……(我剛剛恍神了,再說一次?)").strip()
         meme_id = parsed.meme_id if parsed.meme_id in MEMES else None
+        if meme_id and random.random() > MEME_SEND_CHANCE:
+            meme_id = None  # 情境符合也不一定真的附圖,降低發圖頻率
         history.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
         history.append(types.Content(role="model", parts=[types.Part(text=reply_text)]))
         return reply_text, meme_id
