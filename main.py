@@ -142,9 +142,9 @@ TOO_LONG_REPLIES = (
     "字太多 我好懶",
 )
 
-# 連續 429 的次數與已經用過的回覆,額度視窗重置(下次呼叫成功)時歸零
-_rate_limit_streak = 0
-_rate_limit_replies_used: list[str] = []
+# 每個使用者各自連續 429 的次數與已經用過的回覆,額度視窗重置(下次呼叫成功)時歸零
+_rate_limit_streaks: dict[str, int] = defaultdict(int)
+_rate_limit_replies_used: dict[str, list[str]] = defaultdict(list)
 
 # 每個 LINE 使用者各自的對話記憶(最近幾輪),存在記憶體,服務重啟就會清空
 MAX_HISTORY_MESSAGES = 24  # 12 輪對話(使用者+小毒各算一則)
@@ -163,7 +163,6 @@ def generate_reply(
     回傳 (回覆文字, meme_id)。回覆文字為 None 代表這則訊息選擇不回覆(已讀不回)。
     image_bytes 有帶的話,連同 user_text 一起送給 Gemini 做圖片理解;
     但圖片本身不存進歷史記憶(太占空間/token),只留 user_text 這句描述。"""
-    global _rate_limit_streak, _rate_limit_replies_used
     history = _conversation_history[user_id]
 
     if len(user_text) > MAX_INPUT_LENGTH:
@@ -191,8 +190,8 @@ def generate_reply(
                 response_schema=MemeReply,
             ),
         )
-        _rate_limit_streak = 0
-        _rate_limit_replies_used = []
+        _rate_limit_streaks[user_id] = 0
+        _rate_limit_replies_used[user_id] = []
         parsed: MemeReply = resp.parsed
         reply_text = (parsed.reply or "……(我剛剛恍神了,再說一次?)").strip()
         meme_id = parsed.meme_id if parsed.meme_id in MEMES else None
@@ -203,12 +202,14 @@ def generate_reply(
         return reply_text, meme_id
     except APIError as e:
         if e.code == 429:
-            _rate_limit_streak += 1
-            if _rate_limit_streak > RATE_LIMIT_REPLY_LIMIT:
+            _rate_limit_streaks[user_id] += 1
+            if _rate_limit_streaks[user_id] > RATE_LIMIT_REPLY_LIMIT:
                 return None, None
-            choices = [r for r in RATE_LIMIT_REPLIES if r not in _rate_limit_replies_used]
+            choices = [
+                r for r in RATE_LIMIT_REPLIES if r not in _rate_limit_replies_used[user_id]
+            ]
             reply = random.choice(choices)
-            _rate_limit_replies_used.append(reply)
+            _rate_limit_replies_used[user_id].append(reply)
             return reply, None
         return "……(我剛剛好像秀逗了,再傳一次?)", None
 
