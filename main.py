@@ -9,6 +9,7 @@ Venom-Bot LINE integration — Stage 1 (Gemini backend)
 只要改 generate_reply() 這一個函式,LINE 這一整套完全不用動。
 """
 
+import io
 import os
 import random
 from collections import defaultdict, deque
@@ -17,6 +18,7 @@ from typing import Optional
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from pypdf import PdfReader
 from linebot.v3 import WebhookParser
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging.exceptions import ApiException as LineApiException
@@ -36,6 +38,7 @@ from linebot.v3.webhooks import (
     ImageMessageContent,
     AudioMessageContent,
     VideoMessageContent,
+    FileMessageContent,
 )
 from google import genai
 from google.genai import types
@@ -158,6 +161,19 @@ VIDEO_TOO_LONG_REPLIES = (
     "這麼長還是傳給我老闆吧 他有耐心才做出我來的",
 )
 
+MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024  # 20MB,下載前的粗篩,真正的限制是頁數
+MAX_PDF_PAGES = 6  # 超過這個頁數不丟給 Gemini
+FILE_UNSUPPORTED_REPLIES = (
+    "這種檔案我看不懂欸",
+    "傳 PDF 我才看得懂喔",
+    "這個格式我打不開,傳看看pdf吧",
+)
+FILE_TOO_LONG_REPLIES = (
+    "太多頁啦",
+    "五六頁好嗎",
+    "太長啦",
+)
+
 # 每個使用者各自連續 429 的次數與已經用過的回覆,額度視窗重置(下次呼叫成功)時歸零
 _rate_limit_streaks: dict[str, int] = defaultdict(int)
 _rate_limit_replies_used: dict[str, list[str]] = defaultdict(list)
@@ -216,6 +232,7 @@ def generate_reply(
                 temperature=0.8,
                 response_mime_type="application/json",
                 response_schema=MemeReply,
+                tools=[types.Tool(url_context=types.UrlContext())],
             ),
         )
         _rate_limit_streaks[user_id] = 0
@@ -318,6 +335,39 @@ async def callback(request: Request):
                     media_mime="video/mp4",
                     media_resolution=types.PartMediaResolutionLevel.MEDIA_RESOLUTION_LOW,
                 )
+        elif isinstance(message, FileMessageContent):
+            if not message.file_name.lower().endswith(".pdf"):
+                input_desc = "(對方傳了一個不支援的檔案格式,沒看)"
+                reply_text, meme_id = _too_long_reply(
+                    user_id, input_desc, FILE_UNSUPPORTED_REPLIES
+                )
+            elif message.file_size and message.file_size > MAX_FILE_SIZE_BYTES:
+                input_desc = "(對方傳了一個太大的檔案,沒看)"
+                reply_text, meme_id = _too_long_reply(
+                    user_id, input_desc, FILE_TOO_LONG_REPLIES
+                )
+            else:
+                with ApiClient(line_config) as api_client:
+                    file_bytes = bytes(
+                        MessagingApiBlob(api_client).get_message_content(message.id)
+                    )
+                try:
+                    page_count = len(PdfReader(io.BytesIO(file_bytes)).pages)
+                except Exception:
+                    page_count = None
+                if page_count is None or page_count > MAX_PDF_PAGES:
+                    input_desc = "(對方傳了一份太長或無法讀取的PDF,沒看)"
+                    reply_text, meme_id = _too_long_reply(
+                        user_id, input_desc, FILE_TOO_LONG_REPLIES
+                    )
+                else:
+                    input_desc = "(對方傳了一份PDF文件)"
+                    reply_text, meme_id = generate_reply(
+                        user_id,
+                        "(對方傳了一份PDF文件,用你的角色風格簡短回應文件內容)",
+                        media_bytes=file_bytes,
+                        media_mime="application/pdf",
+                    )
         else:
             continue
 
