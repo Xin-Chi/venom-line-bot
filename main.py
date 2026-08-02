@@ -12,6 +12,7 @@ Venom-Bot LINE integration — Stage 1 (Gemini backend)
 import io
 import os
 import random
+import re
 from collections import defaultdict, deque
 from typing import Optional
 
@@ -221,18 +222,22 @@ def generate_reply(
         )
 
     contents = list(history) + [types.Content(role="user", parts=parts)]
+    config_kwargs = dict(
+        system_instruction=SYSTEM_PROMPT,
+        max_output_tokens=500,
+        temperature=0.8,
+        response_mime_type="application/json",
+        response_schema=MemeReply,
+    )
+    if re.search(r"https?://\S+", user_text):
+        # 只有真的有網址才掛這個工具,同時掛結構化輸出+網址工具實測有 ~70% 機率 400 錯誤,
+        # 沒必要讓所有訊息都承擔這個風險
+        config_kwargs["tools"] = [types.Tool(url_context=types.UrlContext())]
     try:
         resp = genai_client.models.generate_content(
             model="gemini-flash-lite-latest",
             contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                max_output_tokens=500,
-                temperature=0.8,
-                response_mime_type="application/json",
-                response_schema=MemeReply,
-                tools=[types.Tool(url_context=types.UrlContext())],
-            ),
+            config=types.GenerateContentConfig(**config_kwargs),
         )
         _rate_limit_streaks[user_id] = 0
         _rate_limit_replies_used[user_id] = []
