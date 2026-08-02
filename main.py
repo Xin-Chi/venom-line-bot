@@ -34,6 +34,8 @@ from linebot.v3.webhooks import (
     TextMessageContent,
     StickerMessageContent,
     ImageMessageContent,
+    AudioMessageContent,
+    VideoMessageContent,
 )
 from google import genai
 from google.genai import types
@@ -142,6 +144,20 @@ TOO_LONG_REPLIES = (
     "字太多 我好懶",
 )
 
+MAX_AUDIO_DURATION_MS = 121_000  # 2 分 01 秒
+AUDIO_TOO_LONG_REPLIES = (
+    "語音太長囉",
+    "我老闆說你傳那麼長 我會吃不消",
+    "語音好長 我家瓦斯沒關 溜",
+)
+
+MAX_VIDEO_DURATION_MS = 31_000  # 31 秒
+VIDEO_TOO_LONG_REPLIES = (
+    "影片太長 我家瓦斯沒關 溜",
+    "長影片 的話 呃",
+    "這麼長還是傳給我老闆吧 他有耐心才做出我來的",
+)
+
 # 每個使用者各自連續 429 的次數與已經用過的回覆,額度視窗重置(下次呼叫成功)時歸零
 _rate_limit_streaks: dict[str, int] = defaultdict(int)
 _rate_limit_replies_used: dict[str, list[str]] = defaultdict(list)
@@ -153,29 +169,41 @@ _conversation_history: dict[str, deque] = defaultdict(
 )
 
 
+def _too_long_reply(
+    user_id: str, history_note: str, replies: tuple[str, ...]
+) -> tuple[str, None]:
+    """內容太長(文字/語音/影片)不丟給 Gemini,直接從罐頭回覆挑一句,
+    但仍在歷史記憶裡留一則簡短標記,而不是完全沒印象。"""
+    history = _conversation_history[user_id]
+    reply_text = random.choice(replies)
+    history.append(types.Content(role="user", parts=[types.Part(text=history_note)]))
+    history.append(types.Content(role="model", parts=[types.Part(text=reply_text)]))
+    return reply_text, None
+
+
 def generate_reply(
     user_id: str,
     user_text: str,
-    image_bytes: bytes | None = None,
-    image_mime: str = "image/jpeg",
+    media_bytes: bytes | None = None,
+    media_mime: str | None = None,
+    media_resolution: types.PartMediaResolutionLevel | None = None,
 ) -> tuple[str | None, str | None]:
     """產生回覆。之後換成 fine-tune 模型時,只改這個函式。
     回傳 (回覆文字, meme_id)。回覆文字為 None 代表這則訊息選擇不回覆(已讀不回)。
-    image_bytes 有帶的話,連同 user_text 一起送給 Gemini 做圖片理解;
-    但圖片本身不存進歷史記憶(太占空間/token),只留 user_text 這句描述。"""
+    media_bytes 有帶的話(圖片/語音/影片皆可),連同 user_text 一起送給 Gemini 做多模態理解;
+    但媒體本身不存進歷史記憶(太占空間/token),只留 user_text 這句描述。"""
     history = _conversation_history[user_id]
 
     if len(user_text) > MAX_INPUT_LENGTH:
-        reply_text = random.choice(TOO_LONG_REPLIES)
-        history.append(
-            types.Content(role="user", parts=[types.Part(text="(對方傳了一大串文字,沒細看)")])
-        )
-        history.append(types.Content(role="model", parts=[types.Part(text=reply_text)]))
-        return reply_text, None
+        return _too_long_reply(user_id, "(對方傳了一大串文字,沒細看)", TOO_LONG_REPLIES)
 
     parts = [types.Part(text=user_text)]
-    if image_bytes:
-        parts.append(types.Part.from_bytes(data=image_bytes, mime_type=image_mime))
+    if media_bytes:
+        parts.append(
+            types.Part.from_bytes(
+                data=media_bytes, mime_type=media_mime, media_resolution=media_resolution
+            )
+        )
 
     contents = list(history) + [types.Content(role="user", parts=parts)]
     try:
@@ -250,8 +278,46 @@ async def callback(request: Request):
             reply_text, meme_id = generate_reply(
                 user_id,
                 "(對方傳了一張圖片,用你的角色風格簡短回應圖片內容)",
-                image_bytes=image_bytes,
+                media_bytes=image_bytes,
+                media_mime="image/jpeg",
             )
+        elif isinstance(message, AudioMessageContent):
+            if message.duration and message.duration > MAX_AUDIO_DURATION_MS:
+                input_desc = "(對方傳了一則太長的語音,沒聽)"
+                reply_text, meme_id = _too_long_reply(
+                    user_id, input_desc, AUDIO_TOO_LONG_REPLIES
+                )
+            else:
+                input_desc = "(對方傳了一則語音)"
+                with ApiClient(line_config) as api_client:
+                    audio_bytes = bytes(
+                        MessagingApiBlob(api_client).get_message_content(message.id)
+                    )
+                reply_text, meme_id = generate_reply(
+                    user_id,
+                    "(對方傳了一則語音,用你的角色風格簡短回應語音內容)",
+                    media_bytes=audio_bytes,
+                    media_mime="audio/m4a",
+                )
+        elif isinstance(message, VideoMessageContent):
+            if message.duration and message.duration > MAX_VIDEO_DURATION_MS:
+                input_desc = "(對方傳了一則太長的影片,沒看)"
+                reply_text, meme_id = _too_long_reply(
+                    user_id, input_desc, VIDEO_TOO_LONG_REPLIES
+                )
+            else:
+                input_desc = "(對方傳了一則影片)"
+                with ApiClient(line_config) as api_client:
+                    video_bytes = bytes(
+                        MessagingApiBlob(api_client).get_message_content(message.id)
+                    )
+                reply_text, meme_id = generate_reply(
+                    user_id,
+                    "(對方傳了一則影片,用你的角色風格簡短回應影片內容)",
+                    media_bytes=video_bytes,
+                    media_mime="video/mp4",
+                    media_resolution=types.PartMediaResolutionLevel.MEDIA_RESOLUTION_LOW,
+                )
         else:
             continue
 
