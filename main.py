@@ -14,12 +14,14 @@ import os
 import random
 import re
 from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pypdf import PdfReader
+from supabase import create_client
 from linebot.v3 import WebhookParser
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging.exceptions import ApiException as LineApiException
@@ -29,6 +31,7 @@ from linebot.v3.messaging import (
     MessagingApi,
     MessagingApiBlob,
     ReplyMessageRequest,
+    PushMessageRequest,
     TextMessage,
     ImageMessage,
 )
@@ -52,12 +55,16 @@ app.mount("/memes", StaticFiles(directory="memes"), name="memes")
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
 parser = WebhookParser(LINE_CHANNEL_SECRET)
 line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
+supabase_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 BASE_URL = os.environ.get("BASE_URL", "https://venom-line-bot.onrender.com")
+REMINDER_PUSH_QUOTA_CAP = 165  # 每月推播用量超過這個就不再主動推,留 35 則給手動使用
 
 # ---- 表情包目錄:meme_id -> 檔名(放在 memes/ 資料夾)+ 觸發情境描述 ----
 MEMES = {
@@ -126,12 +133,18 @@ SYSTEM_PROMPT = f"""你是「小毒」,一個講話有禮貌、有耐心、不�
 
 你手上有幾張圖片,可以視情況附加在回覆後面,用 meme_id 指定:
 {MEME_CATALOG_TEXT}
-只有情境真的很符合才附圖,大部分時候 meme_id 留 null 就好,不要每則都硬塞。"""
+只有情境真的很符合才附圖,大部分時候 meme_id 留 null 就好,不要每則都硬塞。
+
+如果對方要求你在一段時間後提醒他做某件事(例如「兩小時後提醒我倒垃圾」「10分鐘後提醒我開會」),
+把時間換算成分鐘填入 reminder_minutes,提醒的具體內容填入 reminder_text,
+並在回覆裡確認你會提醒他。如果對話裡沒有這種設定提醒的請求,這兩個欄位都留 null。"""
 
 
 class MemeReply(BaseModel):
     reply: str
     meme_id: Optional[str] = None
+    reminder_minutes: Optional[int] = None
+    reminder_text: Optional[str] = None
 
 RATE_LIMIT_REPLIES = (
     "你好聒噪喔",
@@ -188,6 +201,87 @@ _conversation_history: dict[str, deque] = defaultdict(
 )
 
 
+def _save_reminder(user_id: str, minutes: int, message: str) -> None:
+    """把提醒存進 Supabase(持久化,撐得過服務重啟)。存失敗不影響當次回覆。"""
+    remind_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    try:
+        supabase_client.table("reminders").insert(
+            {"user_id": user_id, "remind_at": remind_at.isoformat(), "message": message}
+        ).execute()
+    except Exception:
+        pass
+
+
+def _get_overdue_reminders(user_id: str) -> list[dict]:
+    """查這個使用者「時間已到、還沒發送」的提醒。"""
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        resp = (
+            supabase_client.table("reminders")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("delivered", False)
+            .lte("remind_at", now)
+            .execute()
+        )
+        return resp.data
+    except Exception:
+        return []
+
+
+def _mark_reminders_delivered(reminder_ids: list[int]) -> None:
+    if not reminder_ids:
+        return
+    try:
+        supabase_client.table("reminders").update({"delivered": True}).in_(
+            "id", reminder_ids
+        ).execute()
+    except Exception:
+        pass
+
+
+def push_due_reminders() -> None:
+    """由健康檢查路由(每 5 分鐘被 UptimeRobot 觸發)呼叫。
+    檢查所有到期但還沒發送的提醒,額度夠的話主動推播;
+    額度不夠就先跳過,留給使用者下次聊天時用 Reply API 補提(見 generate_reply)。"""
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        resp = (
+            supabase_client.table("reminders")
+            .select("*")
+            .eq("delivered", False)
+            .lte("remind_at", now)
+            .execute()
+        )
+        due = resp.data
+    except Exception:
+        return
+    if not due:
+        return
+
+    try:
+        with ApiClient(line_config) as api_client:
+            consumption = MessagingApi(api_client).get_message_quota_consumption().total_usage
+    except Exception:
+        return  # 查不到目前用量就不冒險發送
+
+    for reminder in due:
+        if consumption >= REMINDER_PUSH_QUOTA_CAP:
+            break  # 額度快用完了,剩下的留給下次聊天時補提
+        try:
+            with ApiClient(line_config) as api_client:
+                MessagingApi(api_client).push_message(
+                    PushMessageRequest(
+                        to=reminder["user_id"],
+                        messages=[TextMessage(text=f"⏰ 提醒你:{reminder['message']}")],
+                    )
+                )
+            _mark_reminders_delivered([reminder["id"]])
+            consumption += 1
+        except Exception:
+            continue  # 這則失敗就跳過,不影響其他人的提醒
+
+
 def _too_long_reply(
     user_id: str, history_note: str, replies: tuple[str, ...]
 ) -> tuple[str, None]:
@@ -216,7 +310,14 @@ def generate_reply(
     if len(user_text) > MAX_INPUT_LENGTH:
         return _too_long_reply(user_id, "(對方傳了一大串文字,沒細看)", TOO_LONG_REPLIES)
 
-    parts = [types.Part(text=user_text)]
+    # 額度不夠時錯過的提醒,趁使用者現在主動聊天,用免費的 Reply API 補提一次
+    overdue_reminders = _get_overdue_reminders(user_id)
+    model_text = user_text
+    if overdue_reminders:
+        notes = "、".join(r["message"] for r in overdue_reminders)
+        model_text += f"\n(順便告訴對方,他之前設定的提醒時間到了,內容:{notes})"
+
+    parts = [types.Part(text=model_text)]
     if media_bytes:
         parts.append(
             types.Part.from_bytes(
@@ -249,6 +350,10 @@ def generate_reply(
         meme_id = parsed.meme_id if parsed.meme_id in MEMES else None
         if meme_id and random.random() > MEME_SEND_CHANCE:
             meme_id = None  # 情境符合也不一定真的附圖,降低發圖頻率
+        if overdue_reminders:
+            _mark_reminders_delivered([r["id"] for r in overdue_reminders])
+        if parsed.reminder_minutes and parsed.reminder_text:
+            _save_reminder(user_id, parsed.reminder_minutes, parsed.reminder_text)
         history.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
         history.append(types.Content(role="model", parts=[types.Part(text=reply_text)]))
         return reply_text, meme_id
@@ -405,6 +510,7 @@ async def callback(request: Request):
 
 
 @app.get("/")
-def health():
-    # Cloud Run 健康檢查用
+def health(background_tasks: BackgroundTasks):
+    # UptimeRobot 每 5 分鐘打這個路由保活,順便借這個頻率檢查有沒有到期的提醒
+    background_tasks.add_task(push_due_reminders)
     return {"status": "ok"}
