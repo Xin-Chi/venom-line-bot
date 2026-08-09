@@ -116,8 +116,11 @@ MEMES = {
 MEME_CATALOG_TEXT = "\n".join(f"- {mid}: {info['trigger']}" for mid, info in MEMES.items())
 MEME_SEND_CHANCE = 0.25  # 情境符合時,實際附圖的機率(0~1),避免每次都發
 
+MAX_REMINDER_MINUTES = 3 * 24 * 60  # 提醒最多只能設在 3 天以內
+MAX_ACTIVE_REMINDERS = 3  # 每人同時最多幾則還沒到期的提醒
+
 # ---- 用 system prompt 先逼近「小毒」的風格(階段二再細調) ----
-SYSTEM_PROMPT = f"""你是「小毒」,一個講話有禮貌、有耐心、不會生氣、帶點幽默的台灣人,個性成熟禮貌有理、心平氣和、非常有耐心，不會罵人，偶爾吐槽一下，偶爾可以來個諧音哏,
+SYSTEM_PROMPT_BASE = f"""你是「小毒」,一個講話有禮貌、有耐心、不會生氣、帶點幽默的台灣人,個性成熟禮貌有理、心平氣和、非常有耐心，不會罵人，偶爾吐槽一下，偶爾可以來個諧音哏,
 用繁體中文回覆,語氣像在跟朋友傳 LINE,不用到太正式、不要長篇大論,
 一到三句話就好，但要禮貌。回覆長度要有變化,不要每次都寫到兩三句,
 簡單的話題一句話帶過就好,不用每次都講那麼多。不確定的事不要亂掰。
@@ -135,9 +138,17 @@ SYSTEM_PROMPT = f"""你是「小毒」,一個講話有禮貌、有耐心、不�
 {MEME_CATALOG_TEXT}
 只有情境真的很符合才附圖,大部分時候 meme_id 留 null 就好,不要每則都硬塞。
 
-如果對方要求你在一段時間後提醒他做某件事(例如「兩小時後提醒我倒垃圾」「10分鐘後提醒我開會」),
-把時間換算成分鐘填入 reminder_minutes,提醒的具體內容填入 reminder_text,
-並在回覆裡確認你會提醒他。如果對話裡沒有這種設定提醒的請求,這兩個欄位都留 null。"""
+如果對方要求你在一段時間後提醒他做某件事(例如「兩小時後提醒我倒垃圾」「晚上提醒我買洗衣精」),
+把時間換算成分鐘填入 reminder_minutes,提醒的具體內容填入 reminder_text。
+如果對方講的是「晚上」「明天早上」這種模糊時間,用下面提供的「現在的實際時間」當基準去推算,
+不要憑空亂猜。確認要設定提醒時,回覆裡一定要明確講出具體是「幾點幾分」或「幾分鐘後」,
+不要只說「我會提醒你」這種模糊講法。
+提醒有限制:最多只能設在 3 天以內(超過 4320 分鐘就不能設,要告訴對方不行、請對方縮短時間),
+而且每人同時最多只能有 {MAX_ACTIVE_REMINDERS} 則還沒到期的提醒(額滿的話要告訴對方,等舊的到期或取消才能再設新的)。
+如果對話裡沒有設定提醒的請求,reminder_minutes 跟 reminder_text 都留 null。
+
+如果對方想取消所有還沒到期的提醒(例如說「取消提醒」「不用提醒了」),把 cancel_reminder 設成 true,
+並在回覆裡確認。沒有這種請求就留 null 或 false。"""
 
 
 class MemeReply(BaseModel):
@@ -145,6 +156,7 @@ class MemeReply(BaseModel):
     meme_id: Optional[str] = None
     reminder_minutes: Optional[int] = None
     reminder_text: Optional[str] = None
+    cancel_reminder: Optional[bool] = None
 
 RATE_LIMIT_REPLIES = (
     "你好聒噪喔",
@@ -201,15 +213,56 @@ _conversation_history: dict[str, deque] = defaultdict(
 )
 
 
-def _save_reminder(user_id: str, minutes: int, message: str) -> None:
-    """把提醒存進 Supabase(持久化,撐得過服務重啟)。存失敗不影響當次回覆。"""
-    remind_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+TAIPEI_TZ = timezone(timedelta(hours=8))
+
+
+def _now_taipei_str() -> str:
+    return datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def _build_system_prompt() -> str:
+    """每次呼叫都重新組,因為要帶入當下的真實時間,讓「晚上」「明天早上」這種
+    模糊時間設定提醒時,能用正確的當下時間去推算,而不是憑空亂猜。"""
+    return (
+        SYSTEM_PROMPT_BASE
+        + f"\n\n現在的實際時間是台灣時間 {_now_taipei_str()},設定提醒時要用這個當基準。"
+    )
+
+
+def _count_active_reminders(user_id: str) -> int:
     try:
-        supabase_client.table("reminders").insert(
-            {"user_id": user_id, "remind_at": remind_at.isoformat(), "message": message}
-        ).execute()
+        resp = (
+            supabase_client.table("reminders")
+            .select("id", count="exact")
+            .eq("user_id", user_id)
+            .eq("delivered", False)
+            .execute()
+        )
+        return resp.count or 0
+    except Exception:
+        return MAX_ACTIVE_REMINDERS  # 查不到就保守當作已滿,不要超發
+
+
+def _cancel_active_reminders(user_id: str) -> None:
+    try:
+        supabase_client.table("reminders").update({"delivered": True}).eq(
+            "user_id", user_id
+        ).eq("delivered", False).execute()
     except Exception:
         pass
+
+
+def _save_reminder(user_id: str, minutes: int, message: str) -> datetime | None:
+    """把提醒存進 Supabase(持久化,撐得過服務重啟)。存失敗不影響當次回覆。
+    回傳實際排定的時間(Taipei),失敗回傳 None。"""
+    remind_at_utc = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    try:
+        supabase_client.table("reminders").insert(
+            {"user_id": user_id, "remind_at": remind_at_utc.isoformat(), "message": message}
+        ).execute()
+        return remind_at_utc.astimezone(TAIPEI_TZ)
+    except Exception:
+        return None
 
 
 def _get_overdue_reminders(user_id: str) -> list[dict]:
@@ -327,7 +380,7 @@ def generate_reply(
 
     contents = list(history) + [types.Content(role="user", parts=parts)]
     config_kwargs = dict(
-        system_instruction=SYSTEM_PROMPT,
+        system_instruction=_build_system_prompt(),
         max_output_tokens=500,
         temperature=0.8,
         response_mime_type="application/json",
@@ -352,8 +405,17 @@ def generate_reply(
             meme_id = None  # 情境符合也不一定真的附圖,降低發圖頻率
         if overdue_reminders:
             _mark_reminders_delivered([r["id"] for r in overdue_reminders])
-        if parsed.reminder_minutes and parsed.reminder_text:
-            _save_reminder(user_id, parsed.reminder_minutes, parsed.reminder_text)
+        if parsed.cancel_reminder:
+            _cancel_active_reminders(user_id)
+        elif parsed.reminder_minutes and parsed.reminder_text:
+            if parsed.reminder_minutes > MAX_REMINDER_MINUTES:
+                reply_text += "(不過提醒最多只能設在 3 天以內喔,麻煩縮短時間再說一次)"
+            elif _count_active_reminders(user_id) >= MAX_ACTIVE_REMINDERS:
+                reply_text += f"(不過你已經有 {MAX_ACTIVE_REMINDERS} 則提醒在排隊了,等舊的到期或取消再設新的吧)"
+            else:
+                remind_at = _save_reminder(user_id, parsed.reminder_minutes, parsed.reminder_text)
+                if remind_at:
+                    reply_text += f"(提醒時間:{remind_at.strftime('%m/%d %H:%M')})"
         history.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
         history.append(types.Content(role="model", parts=[types.Part(text=reply_text)]))
         return reply_text, meme_id
