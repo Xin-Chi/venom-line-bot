@@ -152,7 +152,10 @@ SYSTEM_PROMPT_BASE = f"""你是「小毒」,一個講話有禮貌、有耐心、
 如果對方是要「修改」或「更正」某一則已經存在的提醒(例如「改成半小時後」「我是說9點不是9分鐘」),
 要把原本那則的編號填進 cancel_reminder_ids,同時把新的時間填進 reminder_minutes/reminder_text,
 等於「取消舊的、設一則新的」,不要在舊的還在的情況下又獨立多開一則、變成重複。
-沒有取消或修改的請求就把 cancel_reminder_ids 留 null。"""
+沒有取消或修改的請求就把 cancel_reminder_ids 留 null。
+
+那個「編號」是內部用來判斷要取消哪一則的代號,跟對方對話時絕對不要把編號講出來
+(不要說「編號18」這種話),要用提醒的內容跟時間來描述(例如「多鄰果那則,晚上11點的」)。"""
 
 
 class MemeReply(BaseModel):
