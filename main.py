@@ -252,16 +252,22 @@ def _get_active_reminders(user_id: str) -> list[dict]:
         return []
 
 
-def _cancel_reminder_ids(user_id: str, reminder_ids: list[int]) -> None:
-    """只取消真的屬於這個使用者的提醒 id,防止 Gemini 誤填到別人的 id。"""
+def _cancel_reminder_ids(user_id: str, reminder_ids: list[int]) -> list[dict]:
+    """只取消真的屬於這個使用者的提醒 id,防止 Gemini 誤填到別人的 id。
+    回傳實際被取消的資料列;空陣列代表要求取消的 id 不存在或不是這個人的。"""
     if not reminder_ids:
-        return
+        return []
     try:
-        supabase_client.table("reminders").update({"delivered": True}).eq(
-            "user_id", user_id
-        ).in_("id", reminder_ids).execute()
+        resp = (
+            supabase_client.table("reminders")
+            .update({"delivered": True})
+            .eq("user_id", user_id)
+            .in_("id", reminder_ids)
+            .execute()
+        )
+        return resp.data
     except Exception:
-        pass
+        return []
 
 
 def _push_quota_available() -> bool:
@@ -440,7 +446,10 @@ def generate_reply(
         if overdue_reminders:
             _mark_reminders_delivered([r["id"] for r in overdue_reminders])
         if parsed.cancel_reminder_ids:
-            _cancel_reminder_ids(user_id, parsed.cancel_reminder_ids)
+            cancelled = _cancel_reminder_ids(user_id, parsed.cancel_reminder_ids)
+            if not cancelled:
+                # 沒有真的取消到任何東西(id 不存在或不是這個人的),不能讓 Gemini 誤報成功
+                reply_text = "你要取消的那則好像不存在或不是你的喔"
         if parsed.reminder_minutes and parsed.reminder_text:
             if parsed.reminder_minutes > MAX_REMINDER_MINUTES:
                 reply_text += "(不過提醒最多只能設在 3 天以內喔,麻煩縮短時間再說一次)"
