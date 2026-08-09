@@ -141,14 +141,18 @@ SYSTEM_PROMPT_BASE = f"""你是「小毒」,一個講話有禮貌、有耐心、
 如果對方要求你在一段時間後提醒他做某件事(例如「兩小時後提醒我倒垃圾」「晚上提醒我買洗衣精」),
 把時間換算成分鐘填入 reminder_minutes,提醒的具體內容填入 reminder_text。
 如果對方講的是「晚上」「明天早上」這種模糊時間,用下面提供的「現在的實際時間」當基準去推算,
-不要憑空亂猜。確認要設定提醒時,回覆裡一定要明確講出具體是「幾點幾分」或「幾分鐘後」,
-不要只說「我會提醒你」這種模糊講法。
+不要憑空亂猜。確認要設定提醒時,回覆裡只要用一般人講話的方式帶到大概時間就好(例如「等一下就提醒你」),
+不要自己寫出「(提醒時間:...)」這種格式,系統會自動在你的回覆後面加上精確時間,你不用自己加。
 提醒有限制:最多只能設在 3 天以內(超過 4320 分鐘就不能設,要告訴對方不行、請對方縮短時間),
 而且每人同時最多只能有 {MAX_ACTIVE_REMINDERS} 則還沒到期的提醒(額滿的話要告訴對方,等舊的到期或取消才能再設新的)。
 如果對話裡沒有設定提醒的請求,reminder_minutes 跟 reminder_text 都留 null。
 
-如果對方想取消所有還沒到期的提醒(例如說「取消提醒」「不用提醒了」),把 cancel_reminder 設成 true,
-並在回覆裡確認。沒有這種請求就留 null 或 false。"""
+下面會列出對方目前還沒到期的提醒清單(附編號)。如果對方想取消某一則或全部
+(例如「取消提醒」「不用提醒了」「上一則不用了」),把對應的編號填進 cancel_reminder_ids(陣列)。
+如果對方是要「修改」或「更正」某一則已經存在的提醒(例如「改成半小時後」「我是說9點不是9分鐘」),
+要把原本那則的編號填進 cancel_reminder_ids,同時把新的時間填進 reminder_minutes/reminder_text,
+等於「取消舊的、設一則新的」,不要在舊的還在的情況下又獨立多開一則、變成重複。
+沒有取消或修改的請求就把 cancel_reminder_ids 留 null。"""
 
 
 class MemeReply(BaseModel):
@@ -156,7 +160,7 @@ class MemeReply(BaseModel):
     meme_id: Optional[str] = None
     reminder_minutes: Optional[int] = None
     reminder_text: Optional[str] = None
-    cancel_reminder: Optional[bool] = None
+    cancel_reminder_ids: Optional[list[int]] = None
 
 RATE_LIMIT_REPLIES = (
     "你好聒噪喔",
@@ -229,25 +233,30 @@ def _build_system_prompt() -> str:
     )
 
 
-def _count_active_reminders(user_id: str) -> int:
+def _get_active_reminders(user_id: str) -> list[dict]:
+    """這個使用者所有還沒到期/還沒發送的提醒(不管到期沒),依時間排序,給 Gemini 列清單用。"""
     try:
         resp = (
             supabase_client.table("reminders")
-            .select("id", count="exact")
+            .select("*")
             .eq("user_id", user_id)
             .eq("delivered", False)
+            .order("remind_at")
             .execute()
         )
-        return resp.count or 0
+        return resp.data
     except Exception:
-        return MAX_ACTIVE_REMINDERS  # 查不到就保守當作已滿,不要超發
+        return []
 
 
-def _cancel_active_reminders(user_id: str) -> None:
+def _cancel_reminder_ids(user_id: str, reminder_ids: list[int]) -> None:
+    """只取消真的屬於這個使用者的提醒 id,防止 Gemini 誤填到別人的 id。"""
+    if not reminder_ids:
+        return
     try:
         supabase_client.table("reminders").update({"delivered": True}).eq(
             "user_id", user_id
-        ).eq("delivered", False).execute()
+        ).in_("id", reminder_ids).execute()
     except Exception:
         pass
 
@@ -370,6 +379,16 @@ def generate_reply(
         notes = "、".join(r["message"] for r in overdue_reminders)
         model_text += f"\n(順便告訴對方,他之前設定的提醒時間到了,內容:{notes})"
 
+    # 讓 Gemini 看得到目前還有效的提醒,才能正確判斷「取消」「改成...」是指哪一則
+    active_reminders = _get_active_reminders(user_id)
+    if active_reminders:
+        listing = "\n".join(
+            f"編號{r['id']}: {r['message']} "
+            f"({datetime.fromisoformat(r['remind_at']).astimezone(TAIPEI_TZ).strftime('%m/%d %H:%M')})"
+            for r in active_reminders
+        )
+        model_text += f"\n(對方目前還有效的提醒:\n{listing}\n)"
+
     parts = [types.Part(text=model_text)]
     if media_bytes:
         parts.append(
@@ -400,17 +419,19 @@ def generate_reply(
         _rate_limit_replies_used[user_id] = []
         parsed: MemeReply = resp.parsed
         reply_text = (parsed.reply or "……(我剛剛恍神了,再說一次?)").strip()
+        # Gemini 有時候會自己模仿著寫一句類似的確認文字,把它去掉,只留系統自動加的那句
+        reply_text = re.sub(r"[(（]提醒時間[:：][^)）]*[)）]", "", reply_text).strip()
         meme_id = parsed.meme_id if parsed.meme_id in MEMES else None
         if meme_id and random.random() > MEME_SEND_CHANCE:
             meme_id = None  # 情境符合也不一定真的附圖,降低發圖頻率
         if overdue_reminders:
             _mark_reminders_delivered([r["id"] for r in overdue_reminders])
-        if parsed.cancel_reminder:
-            _cancel_active_reminders(user_id)
-        elif parsed.reminder_minutes and parsed.reminder_text:
+        if parsed.cancel_reminder_ids:
+            _cancel_reminder_ids(user_id, parsed.cancel_reminder_ids)
+        if parsed.reminder_minutes and parsed.reminder_text:
             if parsed.reminder_minutes > MAX_REMINDER_MINUTES:
                 reply_text += "(不過提醒最多只能設在 3 天以內喔,麻煩縮短時間再說一次)"
-            elif _count_active_reminders(user_id) >= MAX_ACTIVE_REMINDERS:
+            elif len(_get_active_reminders(user_id)) >= MAX_ACTIVE_REMINDERS:
                 reply_text += f"(不過你已經有 {MAX_ACTIVE_REMINDERS} 則提醒在排隊了,等舊的到期或取消再設新的吧)"
             else:
                 remind_at = _save_reminder(user_id, parsed.reminder_minutes, parsed.reminder_text)
