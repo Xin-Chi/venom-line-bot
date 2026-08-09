@@ -261,6 +261,16 @@ def _cancel_reminder_ids(user_id: str, reminder_ids: list[int]) -> None:
         pass
 
 
+def _push_quota_available() -> bool:
+    """本月推播額度還夠不夠(< 165)。查不到就保守當作不夠,不要冒險。"""
+    try:
+        with ApiClient(line_config) as api_client:
+            consumption = MessagingApi(api_client).get_message_quota_consumption().total_usage
+        return consumption < REMINDER_PUSH_QUOTA_CAP
+    except Exception:
+        return False
+
+
 def _save_reminder(user_id: str, minutes: int, message: str) -> datetime | None:
     """把提醒存進 Supabase(持久化,撐得過服務重啟)。存失敗不影響當次回覆。
     回傳實際排定的時間(Taipei),失敗回傳 None。"""
@@ -433,6 +443,9 @@ def generate_reply(
                 reply_text += "(不過提醒最多只能設在 3 天以內喔,麻煩縮短時間再說一次)"
             elif len(_get_active_reminders(user_id)) >= MAX_ACTIVE_REMINDERS:
                 reply_text += f"(不過你已經有 {MAX_ACTIVE_REMINDERS} 則提醒在排隊了,等舊的到期或取消再設新的吧)"
+            elif not _push_quota_available():
+                # 額度已經見底,連資料庫都不寫了,直接罐頭回覆
+                reply_text = "這個月額度用完了 還想使用要密一下鍾先生了:("
             else:
                 remind_at = _save_reminder(user_id, parsed.reminder_minutes, parsed.reminder_text)
                 if remind_at:
