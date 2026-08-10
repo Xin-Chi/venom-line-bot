@@ -25,7 +25,7 @@
    申請 Key 時要選「建立新 Project」,額度是綁 Project 不是綁 Key,
    共用同一個 Project 會互相搶額度。
 
-另外有個選填的環境變數 `BASE_URL`(預設是 `https://venom-line-bot.onrender.com`),
+另外有個選填的環境變數 `BASE_URL`(預設是部署出來的 Render 服務網址),
 用來組表情包圖片的公開網址,只有網址跟預設值不同時才需要設定。
 
 ---
@@ -83,22 +83,18 @@ Render 從 GitHub repo 自動部署。免費方案額度用完會暫停服務,�
    - `GEMINI_API_KEY` = 你的值
 6. 按 **Create Web Service**,等它 build + deploy 完成。
 
-完成後 Render 會給你一個網址,例如:
-`https://venom-line-bot.onrender.com`
+完成後 Render 會給你一個網址,格式類似 `https://<你的服務名稱>.onrender.com`。
 
 > **免費方案會休眠**:閒置 15 分鐘會休眠,下一則訊息要等 30–60 秒冷啟動才有反應,
 > 之後對話就即時。可以用 [UptimeRobot](https://uptimerobot.com/) 免費方案
-> 每 5 分鐘 ping 一次 `/` 這個健康檢查路由來保持喚醒,詳見專案報告。
+> 每 5 分鐘 ping 一次根目錄(`/`)這個健康檢查路由來保持喚醒,詳見專案報告。
 
 ---
 
 ## 步驟 D:把網址接回 LINE
 
-回到 LINE Developers Console → Messaging API 分頁 → Webhook URL,填入:
-```
-https://venom-line-bot.onrender.com/callback
-```
-(換成 Render 給你的實際網址,結尾記得加 `/callback`)
+回到 LINE Developers Console → Messaging API 分頁 → Webhook URL,填入
+Render 給你的服務網址,結尾加上 `/callback`(例如 `https://<你的服務名稱>.onrender.com/callback`)。
 
 按 **Verify** 確認能連通,並把 **Use webhook** 打開。
 
