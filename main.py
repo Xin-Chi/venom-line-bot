@@ -13,8 +13,10 @@ import io
 import os
 import random
 import re
+import smtplib
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
 from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -57,6 +59,8 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]
+EMAIL_APP_PASSWORD = os.environ["EMAIL_APP_PASSWORD"]
 
 parser = WebhookParser(LINE_CHANNEL_SECRET)
 line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
@@ -65,6 +69,8 @@ supabase_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 BASE_URL = os.environ.get("BASE_URL", "https://venom-line-bot.onrender.com")
 REMINDER_PUSH_QUOTA_CAP = 165  # 每月推播用量超過這個就不再主動推,留 35 則給手動使用
+# 用量跨過這些門檻時寄 email 通知(25 的倍數 + 165 這個自動推播上限)
+QUOTA_ALERT_THRESHOLDS = sorted({25, 50, 75, 100, 125, 150, REMINDER_PUSH_QUOTA_CAP, 175, 200})
 
 # ---- 表情包目錄:meme_id -> 檔名(放在 memes/ 資料夾)+ 觸發情境描述 ----
 MEMES = {
@@ -317,6 +323,69 @@ def _mark_reminders_delivered(reminder_ids: list[int]) -> None:
         supabase_client.table("reminders").update({"delivered": True}).in_(
             "id", reminder_ids
         ).execute()
+    except Exception:
+        pass
+
+
+def _send_email(subject: str, body: str) -> None:
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_ADDRESS
+    msg["To"] = EMAIL_ADDRESS
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+            server.send_message(msg)
+    except Exception:
+        pass
+
+
+def check_quota_alert() -> None:
+    """由健康檢查路由(每 5 分鐘被 UptimeRobot 觸發)呼叫。
+    LINE 推播用量跨過 25 的倍數或 165(自動推播上限)時寄 email 通知,
+    用 Supabase 記一筆「這個月已經通知到哪個門檻」,避免同一個門檻重複寄信;
+    每月月初(month 欄位跟現在對不上)會自動重新歸零。"""
+    try:
+        with ApiClient(line_config) as api_client:
+            consumption = MessagingApi(api_client).get_message_quota_consumption().total_usage
+    except Exception:
+        return
+
+    current_month = datetime.now(TAIPEI_TZ).strftime("%Y-%m")
+    try:
+        resp = supabase_client.table("quota_alert_state").select("*").eq("id", 1).execute()
+        state = resp.data[0] if resp.data else {"month": "", "last_notified_threshold": 0}
+    except Exception:
+        return
+
+    last_notified = state["last_notified_threshold"] if state["month"] == current_month else 0
+    crossed = [t for t in QUOTA_ALERT_THRESHOLDS if last_notified < t <= consumption]
+
+    if not crossed:
+        if state["month"] != current_month:
+            try:
+                supabase_client.table("quota_alert_state").update(
+                    {"month": current_month, "last_notified_threshold": 0}
+                ).eq("id", 1).execute()
+            except Exception:
+                pass
+        return
+
+    new_threshold = max(crossed)
+    note = (
+        "已達自動推播上限,超過的提醒會改成下次聊天時補提"
+        if new_threshold == REMINDER_PUSH_QUOTA_CAP
+        else "來到新的用量里程碑"
+    )
+    _send_email(
+        f"⏰ 小毒推播用量提醒:本月已用 {consumption} 則",
+        f"本月 LINE 推播用量來到 {consumption} 則({note})。\n"
+        f"自動推播上限:{REMINDER_PUSH_QUOTA_CAP} 則 / LINE 免費總額度:200 則",
+    )
+    try:
+        supabase_client.table("quota_alert_state").update(
+            {"month": current_month, "last_notified_threshold": new_threshold}
+        ).eq("id", 1).execute()
     except Exception:
         pass
 
@@ -619,6 +688,7 @@ async def callback(request: Request):
 
 @app.get("/")
 def health(background_tasks: BackgroundTasks):
-    # UptimeRobot 每 5 分鐘打這個路由保活,順便借這個頻率檢查有沒有到期的提醒
+    # UptimeRobot 每 5 分鐘打這個路由保活,順便借這個頻率檢查有沒有到期的提醒、用量門檻
     background_tasks.add_task(push_due_reminders)
+    background_tasks.add_task(check_quota_alert)
     return {"status": "ok"}
