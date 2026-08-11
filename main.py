@@ -296,8 +296,15 @@ def _schedule_reminder_ping(remind_at_utc: datetime) -> int | None:
     """在 cron-job.org 建立一個一次性排程,精確在提醒到期那一刻 ping 回 /reminder-tick,
     讓提醒能準時送達,不用等 UptimeRobot 下一次的 5 分鐘 ping。
     這只是「精準版」,失敗就回傳 None——既有的 5 分鐘輪詢(push_due_reminders)
-    仍然會接住,不影響提醒最終一定送達的正確性。"""
-    remind_at_taipei = remind_at_utc.astimezone(TAIPEI_TZ)
+    仍然會接住,不影響提醒最終一定送達的正確性。
+
+    cron-job.org 排程只能精準到「分鐘」,沒有秒。如果直接捨去秒數,排程時間可能
+    比真正的到期時間早最多 59 秒觸發,那時 push_due_reminders() 查「到期時間 <=
+    現在」還查不到東西,等於白跑一次、提醒沒送出去。所以這裡無條件進位到下一整分,
+    確保排程觸發的時間點一定在真正到期時間之後(晚最多 59 秒送達,但絕不會早)。"""
+    remind_at_taipei = remind_at_utc.astimezone(TAIPEI_TZ).replace(microsecond=0)
+    if remind_at_taipei.second:
+        remind_at_taipei = remind_at_taipei.replace(second=0) + timedelta(minutes=1)
     tick_url = f"{BASE_URL}/reminder-tick?key={REMINDER_TICK_SECRET}"
     payload = {
         "job": {
