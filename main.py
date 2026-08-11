@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from typing import Optional
 
+import requests
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -61,6 +62,8 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]
 EMAIL_APP_PASSWORD = os.environ["EMAIL_APP_PASSWORD"]
+CRON_JOB_ORG_API_KEY = os.environ["CRON_JOB_ORG_API_KEY"]
+REMINDER_TICK_SECRET = os.environ["REMINDER_TICK_SECRET"]
 
 parser = WebhookParser(LINE_CHANNEL_SECRET)
 line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
@@ -271,9 +274,12 @@ def _cancel_reminder_ids(user_id: str, reminder_ids: list[int]) -> list[dict]:
             .in_("id", reminder_ids)
             .execute()
         )
-        return resp.data
+        cancelled = resp.data
     except Exception:
         return []
+    for r in cancelled:
+        _delete_cron_job(r.get("cron_job_id"))
+    return cancelled
 
 
 def _push_quota_available() -> bool:
@@ -286,17 +292,84 @@ def _push_quota_available() -> bool:
         return False
 
 
+def _schedule_reminder_ping(remind_at_utc: datetime) -> int | None:
+    """在 cron-job.org 建立一個一次性排程,精確在提醒到期那一刻 ping 回 /reminder-tick,
+    讓提醒能準時送達,不用等 UptimeRobot 下一次的 5 分鐘 ping。
+    這只是「精準版」,失敗就回傳 None——既有的 5 分鐘輪詢(push_due_reminders)
+    仍然會接住,不影響提醒最終一定送達的正確性。"""
+    remind_at_taipei = remind_at_utc.astimezone(TAIPEI_TZ)
+    tick_url = f"{BASE_URL}/reminder-tick?key={REMINDER_TICK_SECRET}"
+    payload = {
+        "job": {
+            "url": tick_url,
+            "enabled": True,
+            "title": "venom-bot reminder tick",
+            "saveResponses": False,
+            "requestTimeout": 30,
+            "redirectSuccess": True,
+            "requestMethod": 0,  # GET
+            "schedule": {
+                "timezone": "Asia/Taipei",
+                "expiresAt": 0,
+                "hours": [remind_at_taipei.hour],
+                "minutes": [remind_at_taipei.minute],
+                "mdays": [remind_at_taipei.day],
+                "months": [remind_at_taipei.month],
+                "wdays": [-1],
+            },
+        }
+    }
+    try:
+        resp = requests.put(
+            "https://api.cron-job.org/jobs",
+            headers={
+                "Authorization": f"Bearer {CRON_JOB_ORG_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json().get("jobId")
+    except Exception:
+        return None
+
+
+def _delete_cron_job(job_id: int | None) -> None:
+    """提醒取消或已送達時,把對應的一次性排程清掉,避免留下沒用的 job。失敗就算了,
+    cron-job.org 免費額度足夠,留著頂多是浪費一個 job 名額,不影響功能正確性。"""
+    if not job_id:
+        return
+    try:
+        requests.delete(
+            f"https://api.cron-job.org/jobs/{job_id}",
+            headers={"Authorization": f"Bearer {CRON_JOB_ORG_API_KEY}"},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
 def _save_reminder(user_id: str, minutes: int, message: str) -> datetime | None:
     """把提醒存進 Supabase(持久化,撐得過服務重啟)。存失敗不影響當次回覆。
     回傳實際排定的時間(Taipei),失敗回傳 None。"""
     remind_at_utc = datetime.now(timezone.utc) + timedelta(minutes=minutes)
     try:
-        supabase_client.table("reminders").insert(
+        resp = supabase_client.table("reminders").insert(
             {"user_id": user_id, "remind_at": remind_at_utc.isoformat(), "message": message}
         ).execute()
-        return remind_at_utc.astimezone(TAIPEI_TZ)
     except Exception:
         return None
+
+    job_id = _schedule_reminder_ping(remind_at_utc)
+    if job_id:
+        try:
+            supabase_client.table("reminders").update({"cron_job_id": job_id}).eq(
+                "id", resp.data[0]["id"]
+            ).execute()
+        except Exception:
+            pass
+    return remind_at_utc.astimezone(TAIPEI_TZ)
 
 
 def _get_overdue_reminders(user_id: str) -> list[dict]:
@@ -316,15 +389,19 @@ def _get_overdue_reminders(user_id: str) -> list[dict]:
         return []
 
 
-def _mark_reminders_delivered(reminder_ids: list[int]) -> None:
-    if not reminder_ids:
+def _mark_reminders_delivered(reminders: list[dict]) -> None:
+    """接收完整的提醒資料列(要有 id,最好也有 cron_job_id),標記已送達
+    並清掉對應的 cron-job.org 一次性排程。"""
+    if not reminders:
         return
     try:
         supabase_client.table("reminders").update({"delivered": True}).in_(
-            "id", reminder_ids
+            "id", [r["id"] for r in reminders]
         ).execute()
     except Exception:
         pass
+    for r in reminders:
+        _delete_cron_job(r.get("cron_job_id"))
 
 
 def _send_email(subject: str, body: str) -> None:
@@ -426,7 +503,7 @@ def push_due_reminders() -> None:
                         messages=[TextMessage(text=f"⏰ 提醒你:{reminder['message']}")],
                     )
                 )
-            _mark_reminders_delivered([reminder["id"]])
+            _mark_reminders_delivered([reminder])
             consumption += 1
         except Exception:
             continue  # 這則失敗就跳過,不影響其他人的提醒
@@ -513,7 +590,7 @@ def generate_reply(
         if meme_id and random.random() > MEME_SEND_CHANCE:
             meme_id = None  # 情境符合也不一定真的附圖,降低發圖頻率
         if overdue_reminders:
-            _mark_reminders_delivered([r["id"] for r in overdue_reminders])
+            _mark_reminders_delivered(overdue_reminders)
         if parsed.cancel_reminder_ids:
             cancelled = _cancel_reminder_ids(user_id, parsed.cancel_reminder_ids)
             if not cancelled:
@@ -691,4 +768,15 @@ def health(background_tasks: BackgroundTasks):
     # UptimeRobot 每 5 分鐘打這個路由保活,順便借這個頻率檢查有沒有到期的提醒、用量門檻
     background_tasks.add_task(push_due_reminders)
     background_tasks.add_task(check_quota_alert)
+    return {"status": "ok"}
+
+
+@app.get("/reminder-tick")
+def reminder_tick(key: str, background_tasks: BackgroundTasks):
+    # 由 cron-job.org 針對個別提醒精確排程觸發,做的事跟 UptimeRobot 觸發的
+    # push_due_reminders 完全一樣,只是時機更準——只是提早/加開一次既有的檢查,
+    # 不會做任何依身份而異的敏感操作,query string 帶的 key 只是防止被隨機掃到的路徑濫用。
+    if key != REMINDER_TICK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    background_tasks.add_task(push_due_reminders)
     return {"status": "ok"}
