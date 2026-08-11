@@ -127,6 +127,10 @@ MEME_SEND_CHANCE = 0.25  # 情境符合時,實際附圖的機率(0~1),避免每�
 
 MAX_REMINDER_MINUTES = 3 * 24 * 60  # 提醒最多只能設在 3 天以內
 MAX_ACTIVE_REMINDERS = 3  # 每人同時最多幾則還沒到期的提醒
+# cron-job.org 排程時間無條件捨去秒數,最多可能比真正到期時間早 59 秒觸發;
+# 「到期」判定額外放寬這個秒數的緩衝,讓提早觸發的那次也查得到、能準時推播,
+# 寧可最多提早約 1 分鐘送達,也不要晚送達。
+REMINDER_DUE_BUFFER_SECONDS = 65
 
 # ---- 用 system prompt 先逼近「小毒」的風格(階段二再細調) ----
 SYSTEM_PROMPT_BASE = f"""你是「小毒」,一個講話有禮貌、有耐心、不會生氣、帶點幽默的台灣人,個性成熟禮貌有理、心平氣和、非常有耐心，不會罵人，偶爾吐槽一下，偶爾可以來個諧音哏,
@@ -304,13 +308,10 @@ def _schedule_reminder_ping(remind_at_utc: datetime) -> int | None:
     這只是「精準版」,失敗就回傳 None——既有的 5 分鐘輪詢(push_due_reminders)
     仍然會接住,不影響提醒最終一定送達的正確性。
 
-    cron-job.org 排程只能精準到「分鐘」,沒有秒。如果直接捨去秒數,排程時間可能
-    比真正的到期時間早最多 59 秒觸發,那時 push_due_reminders() 查「到期時間 <=
-    現在」還查不到東西,等於白跑一次、提醒沒送出去。所以這裡無條件進位到下一整分,
-    確保排程觸發的時間點一定在真正到期時間之後(晚最多 59 秒送達,但絕不會早)。"""
-    remind_at_taipei = remind_at_utc.astimezone(TAIPEI_TZ).replace(microsecond=0)
-    if remind_at_taipei.second:
-        remind_at_taipei = remind_at_taipei.replace(second=0) + timedelta(minutes=1)
+    cron-job.org 排程只能精準到「分鐘」,沒有秒。這裡選擇無條件捨去秒數(退回到
+    那一分鐘的起點),寧可提早最多 59 秒觸發,也不要晚——「到期」的判定(見
+    REMINDER_DUE_BUFFER_SECONDS)有對應放寬,確保提早觸發時查得到、不會白跑。"""
+    remind_at_taipei = remind_at_utc.astimezone(TAIPEI_TZ).replace(second=0, microsecond=0)
     tick_url = f"{BASE_URL}/reminder-tick?key={REMINDER_TICK_SECRET}"
     payload = {
         "job": {
@@ -386,15 +387,17 @@ def _save_reminder(user_id: str, minutes: int, message: str) -> datetime | None:
 
 
 def _get_overdue_reminders(user_id: str) -> list[dict]:
-    """查這個使用者「時間已到、還沒發送」的提醒。"""
-    now = datetime.now(timezone.utc).isoformat()
+    """查這個使用者「時間已到、還沒發送」的提醒(含 REMINDER_DUE_BUFFER_SECONDS 緩衝)。"""
+    due_before = (
+        datetime.now(timezone.utc) + timedelta(seconds=REMINDER_DUE_BUFFER_SECONDS)
+    ).isoformat()
     try:
         resp = (
             supabase_client.table("reminders")
             .select("*")
             .eq("user_id", user_id)
             .eq("delivered", False)
-            .lte("remind_at", now)
+            .lte("remind_at", due_before)
             .execute()
         )
         return resp.data
@@ -481,16 +484,18 @@ def check_quota_alert() -> None:
 
 
 def push_due_reminders() -> None:
-    """由健康檢查路由(每 5 分鐘被 UptimeRobot 觸發)呼叫。
-    檢查所有到期但還沒發送的提醒,額度夠的話主動推播;
+    """由健康檢查路由(每 5 分鐘被 UptimeRobot 觸發,或 /reminder-tick 精準觸發)呼叫。
+    檢查所有到期但還沒發送的提醒(含 REMINDER_DUE_BUFFER_SECONDS 緩衝),額度夠的話主動推播;
     額度不夠就先跳過,留給使用者下次聊天時用 Reply API 補提(見 generate_reply)。"""
-    now = datetime.now(timezone.utc).isoformat()
+    due_before = (
+        datetime.now(timezone.utc) + timedelta(seconds=REMINDER_DUE_BUFFER_SECONDS)
+    ).isoformat()
     try:
         resp = (
             supabase_client.table("reminders")
             .select("*")
             .eq("delivered", False)
-            .lte("remind_at", now)
+            .lte("remind_at", due_before)
             .execute()
         )
         due = resp.data
